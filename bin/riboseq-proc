@@ -8,7 +8,7 @@
 # Stages of one run (one row of the sample sheet, see README.md):
 #   prep   raw checks on the first 1 M reads (3' adapter, modal length, SRA Lite quality signature), then one stream:
 #          source [md5] -> umi_tools extract (optional) -> cutadapt adapter pass -> reverse complement (orient rev)
-#          -> cutadapt pass 2 with the footprint length window -> bowtie2 --very-fast-local against the contaminant
+#          -> cutadapt pass 2 with the footprint length window -> bowtie2 --sensitive-local against the contaminant
 #          index, unaligned reads kept.
 #          Gate 2: modal length of the depleted reads inside the expected range.
 #   align  STAR, unique mappers only (--outFilterMultimapNmax 1), end to end, at most 1 mismatch.
@@ -216,7 +216,7 @@ stage_prep() {
   set +e
   raw_stream | tee "$S/md5.fifo" | decomp | limit_reads | umi_raw | adapter_pass | revcomp | umi_trimmed | pass2 \
     | tee "$S/len.fifo" \
-    | "$BOWTIE2" --very-fast-local -p "$BT" -x "$CONTAM" -U - --un-gz "$S/clean.fq.gz" -S /dev/null \
+    | "$BOWTIE2" --sensitive-local -p "$BT" -x "$CONTAM" -U - --un-gz "$S/clean.fq.gz" -S /dev/null \
         2> "$Q/$RUN.bowtie2_contam.log"
   ps=("${PIPESTATUS[@]}")
   set -e

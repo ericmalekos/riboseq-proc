@@ -28,8 +28,8 @@ published tag is never rebuilt). Every conda package is pinned by URL and md5 in
 | rclone | 1.75.2 | reading from and writing to object storage |
 
 ```bash
-docker run --rm ghcr.io/ericmalekos/riboseq-proc:0.1.1 riboseq-proc version
-singularity exec docker://ghcr.io/ericmalekos/riboseq-proc:0.1.1 riboseq-proc version
+docker run --rm ghcr.io/ericmalekos/riboseq-proc:0.1.2 riboseq-proc version
+singularity exec docker://ghcr.io/ericmalekos/riboseq-proc:0.1.2 riboseq-proc version
 ```
 
 The image runs as a non-root user and has no entrypoint: pass the command.
@@ -112,7 +112,9 @@ but more than 5% of reads contain the TruSeq adapter. Then one stream runs from 
 md5 of the source bytes, optional UMI extraction, `cutadapt -a ADAPTER -e 0.1 -O 3 -m 2`
 (with `--discard-untrimmed` in `require` mode), reverse complement for `orient rev`, a second cutadapt pass with
 the options of `pass2` and the length window, and
-`bowtie2 --very-fast-local` against the contaminant index, keeping the reads that do not align.
+`bowtie2 --sensitive-local` against the contaminant index, keeping the reads that do not align
+(0.1.1 and earlier used `--very-fast-local`, which lets rRNA fragments with one to three extra 5' bases through;
+some of them then align uniquely to unannotated genomic rRNA copies and reach the final BAM).
 Gate 2 compares the modal length of the depleted reads with `expect`: PASS inside, WARN outside, FAIL (run stopped)
 when the mode sits at the upper length cap or no read is left. The reads before depletion are not used for the
 gate: in an rRNA-rich library their mode is often one rRNA fragment.
@@ -190,7 +192,7 @@ ref/qc.gtf             annotation with CDS records for the periodicity check (fo
 
 ```bash
 docker run --rm -v /data/ref:/ref:ro -v /data/fastq:/data/fastq:ro -v /scratch/out:/out \
-    -e THREADS=16 -e OUT=/out ghcr.io/ericmalekos/riboseq-proc:0.1.1 \
+    -e THREADS=16 -e OUT=/out ghcr.io/ericmalekos/riboseq-proc:0.1.2 \
     riboseq-proc dataset --sheet /out/sheet.tsv --dataset GSE00001 --par 2
 ```
 

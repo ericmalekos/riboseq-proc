@@ -113,7 +113,7 @@ tRNA GTF    ${TRNA:-none}${TRNA:+ (md5 $(md5sum "$TRNA" | cut -d' ' -f1))}${TRNA
 rDNA FASTA  $(if (( ${#RDNA[@]} )); then for f in "${RDNA[@]}"; do printf '%s (md5 %s, %s) ' "$f" "$(md5sum "$f" | cut -d' ' -f1)" "$(head -n 1 "$f" | cut -c2-60)"; done; else echo none; fi)
 genome      $GENOME (.fai md5 $(md5sum "$GENOME.fai" | cut -d' ' -f1))
 contaminant index $PREFIX: $n_seq sequences, $bp_seq bp = merged exons of gene_type $DEPLETE${TRNA:+, the tRNA GTF records}${RDNA[@]+, the rDNA FASTA}
-  use: bowtie2 --very-fast-local -x $PREFIX -U reads.fq --un-gz unaligned.fq.gz -S /dev/null
+  use: bowtie2 --sensitive-local -x $PREFIX -U reads.fq --un-gz unaligned.fq.gz -S /dev/null
 ncRNA loci  $NCBED: $n_all merged intervals, $bp_all bp = the $n_dep depletion intervals plus $n_post intervals of gene_type $POSTFILT
   use: bedtools intersect -v -split -abam in.bam -b $NCBED > kept.bam   (aligned blocks only; samtools view -L
        $NCBED -U kept.bam also removes reads spliced across a locus)
