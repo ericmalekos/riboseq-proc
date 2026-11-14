@@ -1,0 +1,5 @@
+dataset	run	sample	condition	source_type	source	md5	adapter	adapter_mode	orient	umi	pass2	minlen	maxlen	expect	umi_dedup	rtlens	minpct	notes
+GSE00001	SRR0000001	BMDM_ctrl_1	ctrl	fastq	/data/fastq/GSE00001/SRR0000001.fastq.gz	-	AGATCGGAAGAGC	require	fwd	-	-	20	40	28-32	no	25,35	50	TruSeq small RNA style library, single end
+GSE00002	SRR0000002	Tcell_act_1	activated	rclone	nrp:mybucket/fastq/GSE00002/SRR0000002.fastq.gz	0123456789abcdef0123456789abcdef	AGATCGGAAGAGC	require	fwd	trimmed:^(?P<umi_1>.{2}).+(?P<umi_2>.{5})$	-	20	40	28-32	yes	25,35	50	UMI: 2 nt at the 5 prime end and 5 nt at the 3 prime end of the insert
+GSE00003	SRR0000003	DC_1	ctrl	fastq	/data/fastq/GSE00003/SRR0000003.fastq.gz	-	-	-	fwd	-	-	20	40	25-29	no	24,32	40	reads deposited already trimmed; lower minpct for a broad MNase length distribution
+GSE00004	SRR0000004	Mac_LPS_1	LPS	fastq	/data/fastq/GSE00004/SRR0000004_2.fastq.gz	-	GATCGTCGGACTGTAGAACTCTGAAC	require	rev	-	-	20	40	28-32	no	25,35	50	read 2 of a pair (read 1 unusable): the adapter is the reverse complement of the 5 prime adapter

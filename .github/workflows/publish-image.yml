@@ -1,0 +1,60 @@
+name: Publish image
+
+# Builds the image and pushes it to ghcr.io/<owner>/riboseq-proc:<VERSION> (never :latest).
+# Runs when the Dockerfile, a lockfile, a script or VERSION changes on main, or by hand.
+# A tag that exists is never rebuilt: bump VERSION to publish a change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'VERSION'
+      - 'locks/**'
+      - 'bin/**'
+      - 'refs/**'
+      - '.github/workflows/publish-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image reference
+        id: ref
+        run: |
+          v=$(tr -d '[:space:]' < VERSION)
+          echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "VERSION is not x.y.z: $v"; exit 1; }
+          echo "ref=ghcr.io/${{ github.repository_owner }}/riboseq-proc:$v" >> "$GITHUB_OUTPUT"
+      - name: Script checks
+        run: |
+          bash -n bin/riboseq-proc
+          bash -n refs/build_refs.sh
+          python3 -m py_compile bin/periodicity_gate.py
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Skip a tag that already exists
+        id: exists
+        run: |
+          if docker manifest inspect "${{ steps.ref.outputs.ref }}" > /dev/null 2>&1; then
+            echo "${{ steps.ref.outputs.ref }} exists; bump VERSION to rebuild"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.exists.outputs.skip == 'false'
+      - uses: docker/build-push-action@v6
+        if: steps.exists.outputs.skip == 'false'
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ref.outputs.ref }}
+          provenance: false
