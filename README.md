@@ -28,8 +28,8 @@ published tag is never rebuilt). Every conda package is pinned by URL and md5 in
 | rclone | 1.75.2 | reading from and writing to object storage |
 
 ```bash
-docker run --rm ghcr.io/ericmalekos/riboseq-proc:0.1.0 riboseq-proc version
-singularity exec docker://ghcr.io/ericmalekos/riboseq-proc:0.1.0 riboseq-proc version
+docker run --rm ghcr.io/ericmalekos/riboseq-proc:0.1.1 riboseq-proc version
+singularity exec docker://ghcr.io/ericmalekos/riboseq-proc:0.1.1 riboseq-proc version
 ```
 
 The image runs as a non-root user and has no entrypoint: pass the command.
@@ -42,9 +42,12 @@ riboseq-proc dataset --sheet SHEET --dataset DATASET [--par N]
 riboseq-proc version
 ```
 
-`run` processes one row of the sheet. `dataset` processes every row of one dataset: the prep stage for `PAR` runs
-at a time, then STAR one run at a time with all threads while the post stages of earlier runs go on beside it.
-A run that has a done marker is skipped, so a restarted job continues where the last one stopped.
+`run` processes one row of the sheet. `dataset` processes every row of one dataset, `PAR` runs at a time, each
+from prep to post with `THREADS / PAR` threads. The STAR index is loaded into shared memory once
+(`STAR --genomeLoad LoadAndExit`), every STAR run attaches to it (`LoadAndKeep`), and it is removed when the
+command ends, also after a failure or a SIGTERM. With `SHARE_GENOME=0` each STAR run loads the index itself and
+only one STAR runs at a time. A run that has a done marker is skipped, so a restarted job continues where the
+last one stopped.
 
 Exit codes of `run`: 0 done, 2 stopped by a data gate (a property of the reads, not a failure of the tool),
 1 anything else. `dataset` exits 1 when at least one run failed for a reason other than a gate.
@@ -58,13 +61,21 @@ Exit codes of `run`: 0 done, 2 stopped by a data gate (a property of the reads, 
 | `OUT` | `$PWD/results` | results |
 | `OUT_REMOTE` | empty | rclone remote path; when set, QC tables, BAMs and done markers are copied there and compared by checksum, and the local BAM is removed after it verified |
 | `THREADS` | `$NRP_CPUS`, `$SLURM_CPUS_PER_TASK` or 4 | always set it inside containers: `nproc` reports the whole node |
-| `PAR` | 1 | runs processed at the same time in prep and post |
+| `PAR` | 1 | runs of a dataset processed at the same time (also `--par`) |
 | `KEEP_CLEAN` | 0 | 1 keeps the depleted FASTQ in `OUT/<dataset>/fastq_clean/` |
-| `BAMSORT_RAM` | 20000000000 | STAR `--limitBAMsortRAM` |
+| `BAMSORT_RAM` | 4000000000 | STAR `--limitBAMsortRAM`, per STAR run; a run that needs more stops with STAR's message, which names the value to set |
+| `SHARE_GENOME` | 1 | `dataset` only. 1: the STAR index is held once in SysV shared memory for all runs; 0: no shared memory, one STAR at a time |
 | `NCRNA_FILTER` | `blocks` | `blocks`: a read is removed when one of its aligned blocks overlaps an ncRNA locus; `span`: when its alignment span does, introns included (the behaviour of `samtools view -L`) |
 | `MAX_READS` | 0 | test mode: process only the first N reads of each source; the md5 is then not checked, and the summaries and the done marker say so |
 
-Memory: STAR holds the whole index (about 32 GB for a mouse or human genome) plus the sort buffer.
+Memory: the STAR index (about 27 GB for a mouse or human genome) is held once, whatever `PAR` is. Each run adds its
+BAM sort buffer (`BAMSORT_RAM`) and about 2 GB for cutadapt, bowtie2 and the post stage, so plan for the index plus
+`PAR` x (`BAMSORT_RAM` + 2 GB). With `SHARE_GENOME=1` the index stays in memory during the prep and post stages
+too, which keeps the memory use of a job steady. Shared memory needs `kernel.shmmax` and `kernel.shmall` at least
+as large as the index (the Linux default is unlimited), and in a container it counts toward the memory limit.
+A SIGKILL leaves the segment behind: `ipcs -m` lists it, `STAR --genomeLoad Remove --genomeDir DIR` or
+`ipcrm -m ID` frees it. Only one `dataset` command per index and host should use `SHARE_GENOME=1` at a time, since
+the first to finish removes the segment.
 
 ## Sample sheet
 
@@ -111,8 +122,9 @@ gate: in an rRNA-rich library their mode is often one rRNA fragment.
 aligner: the common ORF callers do not remove multi-mappers themselves.
 
 **post.** Reads on the chromosomes of `chroms.txt` are kept, reads that overlap `ncrna.bed` are removed, UMIs
-are deduplicated when asked, and `ribotish quality` measures the frame
-distribution per read length over annotated CDSs. Gate 3 (`bin/periodicity_gate.py`) gives PASS, WARN or FAIL:
+are deduplicated when asked, the reads on annotated CDSs are counted by strand (`strand` in the summary: `sense`
+at 80% or more, `antisense` at 20% or less, which means the row needs `orient rev`, else `mixed`), and
+`ribotish quality` measures the frame distribution per read length over annotated CDSs. Gate 3 (`bin/periodicity_gate.py`) gives PASS, WARN or FAIL:
 FAIL when no read length is periodic or when the periodic lengths hold less than `minpct` of the reads; WARN
 below 5 M reads in periodic lengths or for implausible P-site offsets. The BAM is delivered whatever the verdict;
 the verdict is recorded in the summaries and in the done marker.
@@ -131,15 +143,19 @@ OUT/<dataset>/
   qc/<run>.cutadapt_*.log, .bowtie2_contam.log, .umi_extract.log, .umi_dedup.log
   qc/<run>.trim.lengths.tsv, .clean.lengths.tsv
   qc/<run>.prep_summary.tsv        read counts through trimming and depletion, gate 2
-  qc/<run>.STAR.Log.final.out, .SJ.out.tab
+  qc/<run>.STAR.Log.final.out, .SJ.out.tab (.STAR.Log.out when STAR failed)
   qc/<run>.qual.txt, .qual.pdf, .para.py   Ribo-TISH quality output and P-site offsets
   qc/<run>.gate3.txt, .gate3.tsv   periodicity verdict
-  qc/<run>.align_summary.tsv       read counts through alignment and filtering, gate 3
+  qc/<run>.align_summary.tsv       read counts through alignment and filtering, gate 3, CDS strand
   status/<run>.tsv                 one line per stage: stage, state, detail, time
-  done/<run>.json                  written last; holds the md5 of the BAM
-  logs/<run>.<stage>.log           (dataset command)
+  done/<run>.json                  written last; holds the md5 of the BAM (used to verify the upload)
+  logs/<run>.log                   (dataset command)
   prep_summary.tsv, align_summary.tsv, run_states.tsv   (dataset command) all runs of the dataset
 ```
+
+Two runs of the same input give BAMs with the same records but not the same md5: STAR with more than one thread
+does not fix the order of reads that start at the same position, and the header holds the command lines. Compare
+`samtools view FILE | sort | md5sum`, or the read counts of `align_summary.tsv`.
 
 ## References
 
@@ -174,7 +190,7 @@ ref/qc.gtf             annotation with CDS records for the periodicity check (fo
 
 ```bash
 docker run --rm -v /data/ref:/ref:ro -v /data/fastq:/data/fastq:ro -v /scratch/out:/out \
-    -e THREADS=16 -e OUT=/out ghcr.io/ericmalekos/riboseq-proc:0.1.0 \
+    -e THREADS=16 -e OUT=/out ghcr.io/ericmalekos/riboseq-proc:0.1.1 \
     riboseq-proc dataset --sheet /out/sheet.tsv --dataset GSE00001 --par 2
 ```
 

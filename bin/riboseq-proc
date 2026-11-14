@@ -12,16 +12,18 @@
 #          index, unaligned reads kept.
 #          Gate 2: modal length of the depleted reads inside the expected range.
 #   align  STAR, unique mappers only (--outFilterMultimapNmax 1), end to end, at most 1 mismatch.
-#   post   canonical chromosomes, drop reads over ncRNA loci, umi_tools dedup (optional), ribotish quality on
-#          annotated CDSs and the periodicity gate; BAM, QC tables and a done marker, uploaded when OUT_REMOTE is set.
-# "dataset" runs every row of one dataset: prep for PAR runs at a time, then STAR one run at a time with all
-# threads while the post stages of earlier runs go on beside it.
+#   post   canonical chromosomes, drop reads over ncRNA loci, umi_tools dedup (optional), strand of the reads on
+#          annotated CDSs, ribotish quality and the periodicity gate; BAM, QC tables and a done marker, uploaded
+#          when OUT_REMOTE is set.
+# "dataset" runs every row of one dataset, PAR runs at a time, each from prep to post with THREADS / PAR threads.
+# The STAR index is loaded into shared memory once, every STAR run attaches to it, and it is removed when the
+# command ends (SHARE_GENOME=0: each STAR run loads the index itself, one STAR at a time).
 #
 # Settings (environment): REF (reference bundle, default /ref) or its parts STARIDX, CONTAM, NCRNA_BED, QC_GTF,
 # CHROMS; WORK (scratch), OUT (results), OUT_REMOTE (rclone remote path, optional), THREADS, PAR, KEEP_CLEAN=1,
-# BAMSORT_RAM, NCRNA_FILTER (blocks: a read is dropped when one of its aligned blocks overlaps an ncRNA locus;
-# span: when its whole alignment span does, introns included, as "samtools view -L" does), MAX_READS (test mode:
-# only the first N reads of the source are processed and the md5 is not checked).
+# BAMSORT_RAM, SHARE_GENOME, NCRNA_FILTER (blocks: a read is dropped when one of its aligned blocks overlaps an
+# ncRNA locus; span: when its whole alignment span does, introns included, as "samtools view -L" does), MAX_READS
+# (test mode: only the first N reads of the source are processed and the md5 is not checked).
 # Exit codes of "run": 0 done, 2 stopped by a data gate, 1 anything else.
 set -euo pipefail
 HEADER=$'dataset\trun\tsample\tcondition\tsource_type\tsource\tmd5\tadapter\tadapter_mode\torient\tumi\tpass2\tminlen\tmaxlen\texpect\tumi_dedup\trtlens\tminpct\tnotes'
@@ -39,10 +41,13 @@ STARIDX=${STARIDX:-$REF/star}; CONTAM=${CONTAM:-$REF/contam/contam}; NCRNA_BED=$
 QC_GTF=${QC_GTF:-$REF/qc.gtf}; CHROMS=${CHROMS:-$REF/chroms.txt}
 WORK=${WORK:-$PWD/work}; OUT=${OUT:-$PWD/results}; OUT_REMOTE=${OUT_REMOTE:-}
 THREADS=${THREADS:-${NRP_CPUS:-${SLURM_CPUS_PER_TASK:-4}}}
-PAR=${PAR:-1}; KEEP_CLEAN=${KEEP_CLEAN:-0}; BAMSORT_RAM=${BAMSORT_RAM:-20000000000}
-NCRNA_FILTER=${NCRNA_FILTER:-blocks}; MAX_READS=${MAX_READS:-0}
+PAR=${PAR:-1}; KEEP_CLEAN=${KEEP_CLEAN:-0}; BAMSORT_RAM=${BAMSORT_RAM:-4000000000}
+NCRNA_FILTER=${NCRNA_FILTER:-blocks}; MAX_READS=${MAX_READS:-0}; SHARE_GENOME=${SHARE_GENOME:-1}
+# set by "dataset" for its runs: how STAR gets the index, and a lock file when the index is not shared
+GENOME_LOAD=${GENOME_LOAD:-NoSharedMemory}; STAR_LOCK=${STAR_LOCK:-}
 export STAR_BIN CUTADAPT BOWTIE2 SAMTOOLS PIGZ_BIN RCLONE PYTHON BEDTOOLS UMITOOLS RIBOTISH GATE REF STARIDX CONTAM \
-  NCRNA_BED QC_GTF CHROMS WORK OUT OUT_REMOTE PAR KEEP_CLEAN BAMSORT_RAM NCRNA_FILTER MAX_READS PYTHONNOUSERSITE=1
+  NCRNA_BED QC_GTF CHROMS WORK OUT OUT_REMOTE PAR KEEP_CLEAN BAMSORT_RAM NCRNA_FILTER MAX_READS SHARE_GENOME \
+  GENOME_LOAD STAR_LOCK PYTHONNOUSERSITE=1
 
 ts() { date '+%F %T'; }
 die() { echo "ABORT: $*" >&2; exit 1; }
@@ -270,14 +275,26 @@ stage_align() {
   STAGE=align
   [[ -s "$S/clean.fq.gz" ]] || die "no depleted reads for $RUN in $S (run the prep stage first)"
   [[ -s "$STARIDX/SA" ]] || die "no STAR index in $STARIDX"
+  [[ "$GENOME_LOAD" == NoSharedMemory || "$GENOME_LOAD" == LoadAndKeep ]] \
+    || die "GENOME_LOAD must be NoSharedMemory or LoadAndKeep, not $GENOME_LOAD"
   mkdir -p "$Q"
-  say "align $DS $RUN: index=$STARIDX threads=$THREADS host=$(hostname)"
+  say "align $DS $RUN: index=$STARIDX genome_load=$GENOME_LOAD threads=$THREADS host=$(hostname)"
   rm -rf "$S/STARtmp"
-  "$STAR_BIN" --runMode alignReads --genomeDir "$STARIDX" --readFilesIn "$S/clean.fq.gz" --readFilesCommand zcat \
+  local rc=0 why
+  local -a lock=()
+  [[ -z "$STAR_LOCK" ]] || lock=(flock "$STAR_LOCK")      # index not shared: one STAR holds it at a time
+  ${lock[@]+"${lock[@]}"} "$STAR_BIN" --runMode alignReads --genomeDir "$STARIDX" --genomeLoad "$GENOME_LOAD" \
+    --readFilesIn "$S/clean.fq.gz" --readFilesCommand zcat \
     --runThreadN "$THREADS" --alignEndsType EndToEnd --outFilterMultimapNmax 1 --outFilterMismatchNmax 1 \
     --outFilterIntronMotifs RemoveNoncanonicalUnannotated --outSAMattributes NH HI AS nM MD \
     --outSAMtype BAM SortedByCoordinate --limitBAMsortRAM "$BAMSORT_RAM" --outTmpDir "$S/STARtmp" \
-    --outFileNamePrefix "$S/$RUN." > "$Q/$RUN.STAR.stdout.log"
+    --outFileNamePrefix "$S/$RUN." > "$Q/$RUN.STAR.stdout.log" || rc=$?
+  if (( rc != 0 )); then      # keep STAR's own message, for example the --limitBAMsortRAM it asks for
+    cp "$S/$RUN.Log.out" "$Q/$RUN.STAR.Log.out" 2> /dev/null || true
+    why=$({ grep -h -m 1 -A 2 'EXITING' "$Q/$RUN.STAR.stdout.log" "$Q/$RUN.STAR.Log.out" 2> /dev/null || true; } \
+      | tr '\n\t' '  ' | cut -c1-300)
+    stop align FAIL "STAR exit $rc: ${why:-see $RUN.STAR.Log.out}" 1
+  fi
   [[ -s "$S/$RUN.Aligned.sortedByCoord.out.bam" ]] || die "STAR wrote no BAM"
   cp "$S/$RUN.Log.final.out" "$Q/$RUN.STAR.Log.final.out"
   cp "$S/$RUN.SJ.out.tab" "$Q/$RUN.SJ.out.tab"
@@ -286,6 +303,21 @@ stage_align() {
 }
 
 # ---------------------------------------------------------------------------------------------------- post
+cds_bed() {   # CDS intervals of QC_GTF merged per strand (BED6); built once per WORK and annotation file
+  local key c
+  key=$(printf '%s' "$(readlink -f "$QC_GTF"):$(stat -L -c '%s:%Y' "$QC_GTF")" | md5sum | cut -c1-12)
+  c=$WORK/.riboseq-proc.cds.$key.bed
+  if [[ ! -s "$c" ]]; then
+    mkdir -p "$WORK"
+    if [[ "$QC_GTF" == *.gz ]]; then "$PIGZ_BIN" -dc -- "$QC_GTF"; else cat -- "$QC_GTF"; fi \
+      | awk -F'\t' -v OFS='\t' '$3 == "CDS" {print $1, $4 - 1, $5, ".", 0, $7}' | sort -k1,1 -k2,2n \
+      | "$BEDTOOLS" merge -s -c 6 -o distinct -i - | awk -F'\t' -v OFS='\t' '{print $1, $2, $3, ".", 0, $4}' \
+      > "$c.$$.tmp"
+    [[ -s "$c.$$.tmp" ]] || die "no CDS records in $QC_GTF"
+    mv "$c.$$.tmp" "$c"
+  fi
+  echo "$c"
+}
 stage_post() {
   STAGE=post
   local a=$S/$RUN.Aligned.sortedByCoord.out.bam t=$THREADS final
@@ -322,6 +354,16 @@ stage_post() {
   n_fin=$("$SAMTOOLS" view -c -@ "$t" "$final")
   n_spl=$("$SAMTOOLS" view -@ "$t" "$final" | awk '$6 ~ /N/' | wc -l)
 
+  # strand of the reads on annotated CDSs: a library that reads the antisense strand needs the other "orient"
+  local cds n_se n_as se_pct strand
+  cds=$(cds_bed)
+  n_se=$("$BEDTOOLS" intersect -u -s -split -nonamecheck -ubam -abam "$final" -b "$cds" | "$SAMTOOLS" view -c -)
+  n_as=$("$BEDTOOLS" intersect -u -S -split -nonamecheck -ubam -abam "$final" -b "$cds" | "$SAMTOOLS" view -c -)
+  read -r se_pct strand <<< "$(awk -v s="$n_se" -v a="$n_as" 'BEGIN {
+    if (s + a == 0) { print "NA none"; exit }
+    p = 100 * s / (s + a); printf "%.1f %s\n", p, (p >= 80 ? "sense" : (p <= 20 ? "antisense" : "mixed")) }')"
+  say "strand $RUN: $n_se reads on CDS sense, $n_as antisense ($se_pct% sense): $strand"
+
   # periodicity on annotated CDSs; a ribotish failure is a QC failure of the run, the BAM is still delivered
   local rt=0 verdict
   "$RIBOTISH" quality -b "$final" -g "$QC_GTF" -o "$Q/$RUN.qual.txt" -f "$Q/$RUN.qual.pdf" -r "$Q/$RUN.para.py" \
@@ -341,15 +383,15 @@ stage_post() {
   mv "$B/$RUN.bam.tmp" "$B/$RUN.bam"; mv "$B/$RUN.bam.bai.tmp" "$B/$RUN.bam.bai"
   uniq=$(awk -F'|' '/Uniquely mapped reads %/ {gsub(/[ \t]/, "", $2); print $2}' "$Q/$RUN.STAR.Log.final.out")
   input=$(awk -F'|' '/Number of input reads/ {gsub(/[ \t]/, "", $2); print $2}' "$Q/$RUN.STAR.Log.final.out")
-  printf 'dataset\trun\tsample\tcondition\tstar_input\tuniq_pct\tunique_aligned\tcanonical_chroms\tafter_ncrna\tfinal\tspliced_final\tgate3\n%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf 'dataset\trun\tsample\tcondition\tstar_input\tuniq_pct\tunique_aligned\tcanonical_chroms\tafter_ncrna\tfinal\tspliced_final\tgate3\tcds_sense\tcds_antisense\tcds_sense_pct\tstrand\n%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$DS" "$RUN" "$SAMPLE" "$COND" "$input" "$uniq" "$n_all" "$n_can" "$n_cln" "$n_fin" "$n_spl" "$verdict" \
-    > "$Q/$RUN.align_summary.tsv"
+    "$n_se" "$n_as" "$se_pct" "$strand" > "$Q/$RUN.align_summary.tsv"
   cat "$Q/$RUN.align_summary.tsv"
-  status post DONE "gate3 $verdict, $n_fin reads in the final BAM"
+  status post DONE "gate3 $verdict, strand $strand, $n_fin reads in the final BAM"
   mkdir -p "$(dirname "$DONE")"
-  printf '{"dataset": "%s", "run": "%s", "gate3": "%s", "final_reads": %s, "bam_md5": "%s", "riboseq_proc": "%s", "star_index": "%s", "ncrna_filter": "%s", "max_reads": %s, "finished": "%s"}\n' \
-    "$DS" "$RUN" "$verdict" "$n_fin" "$(md5sum "$B/$RUN.bam" | cut -d' ' -f1)" "$RP_VERSION" "$(basename "$STARIDX")" \
-    "$NCRNA_FILTER" "$MAX_READS" "$(date -Iseconds)" > "$DONE.tmp"
+  printf '{"dataset": "%s", "run": "%s", "gate3": "%s", "strand": "%s", "cds_sense_pct": "%s", "final_reads": %s, "bam_md5": "%s", "riboseq_proc": "%s", "star_index": "%s", "ncrna_filter": "%s", "max_reads": %s, "finished": "%s"}\n' \
+    "$DS" "$RUN" "$verdict" "$strand" "$se_pct" "$n_fin" "$(md5sum "$B/$RUN.bam" | cut -d' ' -f1)" "$RP_VERSION" \
+    "$(basename "$STARIDX")" "$NCRNA_FILTER" "$MAX_READS" "$(date -Iseconds)" > "$DONE.tmp"
   mv "$DONE.tmp" "$DONE"
   rm -rf "${S:?}"
   if [[ -n "$OUT_REMOTE" ]]; then
@@ -403,8 +445,51 @@ cmd_run() {
   say "$stage finished for $RUN"
 }
 throttle() { while (( $(jobs -rp | wc -l) >= $1 )); do wait -n || true; done; }
+genome_load() {   # the index goes into SysV shared memory once; STAR runs with --genomeLoad LoadAndKeep attach to it
+  local t=$SECONDS
+  GDIR=$WORK/.genome.$$
+  mkdir -p "$GDIR"
+  say "loading the STAR index $STARIDX into shared memory"
+  if ! "$STAR_BIN" --genomeLoad LoadAndExit --genomeDir "$STARIDX" --outFileNamePrefix "$GDIR/load." \
+      > "$GDIR/load.stdout" 2>&1; then
+    tail -n 8 "$GDIR/load.stdout" "$GDIR/load.Log.out" >&2 || true
+    die "the STAR index could not be loaded into shared memory (kernel.shmmax, kernel.shmall or the memory limit; SHARE_GENOME=0 runs without it)"
+  fi
+  GENOME_LOADED=1
+  say "index loaded ($(( SECONDS - t )) s)"
+}
+genome_remove() {
+  [[ "${GENOME_LOADED:-0}" == 1 ]] || return 0
+  GENOME_LOADED=0
+  if "$STAR_BIN" --genomeLoad Remove --genomeDir "$STARIDX" --outFileNamePrefix "$GDIR/remove." \
+      > "$GDIR/remove.stdout" 2>&1; then
+    say "index removed from shared memory"
+  else
+    say "WARNING: STAR did not remove the index from shared memory; 'ipcs -m' lists what is left"
+  fi
+  rm -rf "${GDIR:?}"
+}
+dataset_exit() {   # stop the runs that are still going (each is its own process group under setsid), then free the index
+  local rc=$? p t
+  local -a pids=()
+  trap - EXIT TERM INT
+  pids=($(jobs -p))
+  for p in ${pids[@]+"${pids[@]}"}; do kill -TERM -- "-$p" 2> /dev/null || kill -TERM "$p" 2> /dev/null || true; done
+  wait 2> /dev/null || true
+  # the tools of a run (STAR, bowtie2) can outlive its shell for a moment, and the kernel frees the index only when
+  # no process is attached to it: wait until each group is empty, at most 30 s, then SIGKILL what is left
+  for p in ${pids[@]+"${pids[@]}"}; do
+    t=0
+    while kill -0 -- "-$p" 2> /dev/null && (( t < 30 )); do sleep 1; t=$((t + 1)); done
+    kill -KILL -- "-$p" 2> /dev/null || true
+  done
+  genome_remove || true
+  [[ -z "$STAR_LOCK" ]] || rm -f "$STAR_LOCK"
+  exit "$rc"
+}
 cmd_dataset() {
   local ds="" run tp st t0 nfail=0 ngate=0 ndone=0 f
+  local -a launch=()
   while (( $# )); do
     case "$1" in
       --sheet) SHEET=$2; shift 2 ;;
@@ -416,34 +501,42 @@ cmd_dataset() {
   [[ -n "${SHEET:-}" && -n "$ds" ]] || die "dataset needs --sheet and --dataset"
   [[ "$PAR" =~ ^[0-9]+$ && "$PAR" -ge 1 && "$THREADS" =~ ^[0-9]+$ && "$THREADS" -ge 1 ]] || die "PAR=$PAR THREADS=$THREADS"
   [[ "$MAX_READS" =~ ^[0-9]+$ ]] || die "MAX_READS=$MAX_READS"
+  [[ "$SHARE_GENOME" == 0 || "$SHARE_GENOME" == 1 ]] || die "SHARE_GENOME=$SHARE_GENOME (0 or 1)"
   check_sheet
   local -a runs
   mapfile -t runs < <(awk -F'\t' -v d="$ds" 'NR > 1 && $1 == d {print $2}' "$SHEET")
   (( ${#runs[@]} > 0 )) || die "no rows of dataset $ds in $SHEET"
+  [[ -s "$STARIDX/SA" ]] || die "no STAR index in $STARIDX"
   tp=$(( THREADS / PAR )); (( tp >= 1 )) || tp=1
-  L=$OUT/$ds/logs; mkdir -p "$L" "$OUT/$ds/done"
+  L=$OUT/$ds/logs; mkdir -p "$L" "$OUT/$ds/done" "$WORK"
   t0=$(date +%s)
-  say "dataset $ds: ${#runs[@]} runs, $THREADS threads, $PAR runs at a time ($tp threads each) in prep and post; host=$(hostname)"
+  say "dataset $ds: ${#runs[@]} runs, $THREADS threads, $PAR runs at a time ($tp threads each), share_genome=$SHARE_GENOME; host=$(hostname)"
   versions | sed 's/^/  /'
   if [[ -n "$OUT_REMOTE" ]]; then    # runs finished by an earlier attempt are not repeated
     "$RCLONE" copy "$OUT_REMOTE/$ds/done" "$OUT/$ds/done"
     say "done markers found in $OUT_REMOTE/$ds: $(find "$OUT/$ds/done" -name '*.json' | wc -l)"
   fi
+  GENOME_LOADED=0; STAR_LOCK=""
+  trap dataset_exit EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  if [[ "$SHARE_GENOME" == 1 ]]; then
+    genome_load
+    GENOME_LOAD=LoadAndKeep
+  else
+    GENOME_LOAD=NoSharedMemory; STAR_LOCK=$WORK/.star.$$.lock
+    : > "$STAR_LOCK"
+  fi
+  export GENOME_LOAD STAR_LOCK
+  ! command -v setsid > /dev/null 2>&1 || launch=(setsid)
   for run in "${runs[@]}"; do
     [[ ! -s "$OUT/$ds/done/$run.json" ]] || continue
-    THREADS=$tp "$SELF" run --sheet "$SHEET" --run "$run" --stage prep > "$L/$run.prep.log" 2>&1 &
+    THREADS=$tp ${launch[@]+"${launch[@]}"} "$SELF" run --sheet "$SHEET" --run "$run" --stage all > "$L/$run.log" 2>&1 &
     throttle "$PAR"
   done
   wait
-  say "prep finished for all runs ($(( $(date +%s) - t0 )) s)"
-  for run in "${runs[@]}"; do
-    [[ "$(last_state "$ds" "$run")" == prep:OK ]] || continue
-    if THREADS=$THREADS "$SELF" run --sheet "$SHEET" --run "$run" --stage align > "$L/$run.align.log" 2>&1; then
-      THREADS=$tp "$SELF" run --sheet "$SHEET" --run "$run" --stage post > "$L/$run.post.log" 2>&1 &
-      throttle "$PAR"
-    fi
-  done
-  wait
+  say "all runs ended ($(( $(date +%s) - t0 )) s)"
+  genome_remove
   for f in prep_summary align_summary; do
     for run in "${runs[@]}"; do [[ ! -s "$OUT/$ds/qc/$run.$f.tsv" ]] || cat "$OUT/$ds/qc/$run.$f.tsv"; done \
       | awk 'NR == 1 || !/^dataset\t/' > "$OUT/$ds/$f.tsv"
@@ -472,5 +565,5 @@ case "${1:-}" in
   run) shift; cmd_run "$@" ;;
   dataset) shift; cmd_dataset "$@" ;;
   version) versions ;;
-  *) sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

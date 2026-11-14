@@ -26,7 +26,8 @@ ENV PATH=/opt/riboseq-proc/bin:/opt/riboseq-proc/refs:/opt/env/bin:/usr/local/sb
     LC_ALL=C.UTF-8 \
     WORK=/work
 # fails the build when a tool is missing or does not start
-RUN riboseq-proc version && bedtools --version && python3 -I /opt/riboseq-proc/bin/periodicity_gate.py --help > /dev/null
+RUN riboseq-proc version && bedtools --version && python3 -I /opt/riboseq-proc/bin/periodicity_gate.py --help > /dev/null \
+ && command -v flock setsid > /dev/null
 USER mambauser
 WORKDIR /work
 ENTRYPOINT []
